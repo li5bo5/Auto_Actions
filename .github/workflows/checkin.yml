@@ -1,0 +1,38 @@
+name: 天翼云盘签到
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+  watch:
+    types: started
+permissions: write-all
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+       TZ: Asia/Shanghai
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: 打印IP地址
+        run: echo "My IP address is $(curl -s ifconfig.me)"
+      - name: 安装 Python 3.8
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.8
+      - name: 安装运行环境
+        run: pip install -r requirements.txt
+      - name: 开始自动签到
+        run: |
+          (echo "[![签到状态](https://github.com/li5bo5/Cloud189-Actions/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/li5bo5/Cloud189-Actions/actions/workflows/main.yml) <br> 签到时间：$(date "+%F %T")" && python3 ./main.py) | tee >(sed 's/^/- /' > STATUS.md)
+        env:
+          TYYP_USERNAME: ${{ secrets.CLOUD_USERNAME }}
+          TYYP_PSW: ${{ secrets.CLOUD_PASSWORD }}
+      - name: Git Auto Commit
+        uses: stefanzweifel/git-auto-commit-action@v4.16.0
+
