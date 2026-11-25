@@ -29,7 +29,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: 开始自动签到
         run: |
-          (echo "[![签到状态](https://github.com/li5bo5/Cloud189-Actions/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/li5bo5/Cloud189-Actions/actions/workflows/main.yml) <br> 签到时间：$(date "+%F %T")" && python3 ./main.py) | tee >(sed 's/^/- /' > STATUS.md)
+          set -o pipefail
+          (echo "[![签到状态](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml/badge.svg?branch=main)](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml) <br> 签到时间：$(date "+%F %T")" && python3 ./main.py) | tee >(sed 's/^/- /' > STATUS.md)
         env:
           TYYP_USERNAME: ${{ secrets.CLOUD_USERNAME }}
           TYYP_PSW: ${{ secrets.CLOUD_PASSWORD }}
