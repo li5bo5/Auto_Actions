@@ -30,10 +30,12 @@ jobs:
       - name: 开始自动签到
         run: |
           set -o pipefail
-          (echo "[![签到状态](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml/badge.svg?branch=main)](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml) <br> 签到时间：$(date "+%F %T")" && python3 ./main.py) | tee >(sed 's/^/- /' > STATUS.md)
+          (echo "[![签到状态](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml/badge.svg?branch=main)](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml) <br> 签到时间：$(date "+%F %T")" && python3 -u ./main.py) | tee >(sed 's/^/- /' > STATUS.md)
         env:
           TYYP_USERNAME: ${{ secrets.CLOUD_USERNAME }}
           TYYP_PSW: ${{ secrets.CLOUD_PASSWORD }}
+          PUSH_ENABLED: ${{ secrets.PUSH_ENABLED || 'true' }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || '' }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || '' }}
       - name: Git Auto Commit
         uses: stefanzweifel/git-auto-commit-action@v7
-

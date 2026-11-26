@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""天翼云盘自动签到脚本（PC 统一登录版）。"""
+"""天翼云盘自动签到脚本（支持断连自动重试与 Telegram 机器人推送）。"""
 
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import sys
 import time
 import rsa
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 WEB_URL = "https://cloud.189.cn"
 AUTH_URL = "https://open.e.189.cn"
@@ -21,6 +24,70 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/87.0.4280.88 Safari/537.36"
 )
+
+# 单账号遇到网络异常（如 RemoteDisconnected / 超时）时的最大整轮重连次数
+MAX_NETWORK_RETRIES = 3
+
+# Telegram 推送配置（与恩山签到保持一致）
+PUSH_ENABLED = os.environ.get("PUSH_ENABLED", "true").strip().lower() == "true"
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
+
+
+def log_err(msg: str) -> None:
+    """输出诊断与推送状态信息到 stderr，避免写入公开的 STATUS.md。"""
+    if TG_BOT_TOKEN:
+        msg = msg.replace(TG_BOT_TOKEN, "***")
+    print(msg, file=sys.stderr, flush=True)
+
+
+def build_session() -> requests.Session:
+    """创建带有底层自动重试策略的 HTTP 会话。"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=None,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json;charset=UTF-8",
+    })
+    return session
+
+
+def push_telegram(text: str) -> None:
+    """推送签到结果通知到 Telegram 机器人。"""
+    if not PUSH_ENABLED:
+        log_err("[推送] PUSH_ENABLED=false，已禁用推送")
+        return
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log_err("[推送] 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送")
+        return
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    data = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+    }
+    try:
+        with build_session() as tg_session:
+            resp = tg_session.post(url, json=data, timeout=15)
+            res = resp.json()
+        if res.get("ok"):
+            log_err("[推送] Telegram 推送成功")
+        else:
+            log_err(f"[推送] Telegram 推送失败: {res}")
+    except Exception as exc:
+        log_err(f"[推送] Telegram 推送异常: {exc}")
 
 
 def rsa_encrypt(pub_key: str, text: str) -> str:
@@ -49,7 +116,7 @@ def _check_api_error(data: dict, action: str) -> None:
 
 def get_encrypt_conf(session: requests.Session) -> tuple[str, str]:
     """获取登录公钥及密码前缀标识。"""
-    resp = session.post(f"{AUTH_URL}/api/logbox/config/encryptConf.do", timeout=15)
+    resp = session.post(f"{AUTH_URL}/api/logbox/config/encryptConf.do", timeout=20)
     resp.raise_for_status()
     payload = resp.json()
     if str(payload.get("result")) != "0" or not isinstance(payload.get("data"), dict):
@@ -72,7 +139,7 @@ def get_login_form(session: requests.Session) -> dict[str, str]:
             "returnURL": RETURN_URL,
             "timeStamp": int(time.time() * 1000),
         },
-        timeout=15,
+        timeout=20,
     )
     resp.raise_for_status()
     html = resp.text
@@ -119,7 +186,7 @@ def login_by_password(session: requests.Session, username: str, password: str) -
             "REQID": form_params["reqId"],
         },
         data=form_data,
-        timeout=15,
+        timeout=20,
     )
     login_resp.raise_for_status()
     login_res = login_resp.json()
@@ -139,7 +206,7 @@ def login_by_password(session: requests.Session, username: str, password: str) -
             "rand": str(int(time.time() * 1000)),
             "redirectURL": login_res["toUrl"],
         },
-        timeout=15,
+        timeout=20,
     )
     session_resp.raise_for_status()
     session_res = session_resp.json()
@@ -165,7 +232,7 @@ def get_user_size_info(session: requests.Session, session_key: str) -> dict:
         f"{WEB_URL}/api/portal/getUserSizeInfo.action",
         params={"sessionKey": session_key},
         headers=_cloud_headers(),
-        timeout=15,
+        timeout=20,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -185,7 +252,7 @@ def user_sign(session: requests.Session, session_key: str) -> dict:
             "sessionKey": session_key,
         },
         headers=_cloud_headers(),
-        timeout=15,
+        timeout=20,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -200,44 +267,120 @@ def _extract_totals(size_info: dict) -> tuple[int, int]:
     return int(cloud_total), int(family_total)
 
 
-def run_account(index: int, username: str, password: str) -> None:
-    """执行单个账号的登录、签到及容量变化统计。"""
+def _run_account_once(username: str, password: str) -> tuple[str, str]:
+    """单次尝试执行登录、签到与容量统计，返回（签到结果描述，容量统计描述）。"""
+    with build_session() as session:
+        session_key = login_by_password(session, username, password)
+
+        before_totals: tuple[int, int] | None = None
+        try:
+            before_totals = _extract_totals(get_user_size_info(session, session_key))
+        except Exception as exc:
+            log_err(f"[提示] 签到前容量查询异常（不影响签到）：{exc}")
+
+        sign_res = user_sign(session, session_key)
+        raw_is_sign = sign_res.get("isSign")
+        already_signed = raw_is_sign is True or str(raw_is_sign).lower() == "true"
+        bonus = sign_res.get("netdiskBonus", 0)
+        if already_signed:
+            sign_msg = f"今日已签到过了，今日奖励 {bonus}M 空间"
+        else:
+            sign_msg = f"签到成功，获得 {bonus}M 空间"
+
+        capacity_msg = ""
+        try:
+            after_cloud, after_family = _extract_totals(get_user_size_info(session, session_key))
+            cloud_total_gb = after_cloud / 1024 / 1024 / 1024
+            family_total_gb = after_family / 1024 / 1024 / 1024
+            if before_totals is not None:
+                before_cloud, before_family = before_totals
+                cloud_diff_mb = (after_cloud - before_cloud) / 1024 / 1024
+                family_diff_mb = (after_family - before_family) / 1024 / 1024
+                capacity_msg = (
+                    f"个人容量：+{cloud_diff_mb:.2f}M / 总计 {cloud_total_gb:.2f}G；"
+                    f"家庭容量：+{family_diff_mb:.2f}M / 总计 {family_total_gb:.2f}G"
+                )
+            else:
+                capacity_msg = f"个人总容量：{cloud_total_gb:.2f}G；家庭总容量：{family_total_gb:.2f}G"
+        except Exception as exc:
+            log_err(f"[提示] 签到后容量查询异常（不影响签到结果）：{exc}")
+
+        return sign_msg, capacity_msg
+
+
+def run_account(index: int, username: str, password: str) -> dict:
+    """带断连重建重试的单账号签到入口。"""
     masked = mask_account(username)
-    print(f"开始执行账号{index}（{masked}）")
+    print(f"开始执行账号{index}（{masked}）", flush=True)
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json;charset=UTF-8",
-    })
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_NETWORK_RETRIES + 1):
+        try:
+            sign_msg, capacity_msg = _run_account_once(username, password)
+            print("登录成功", flush=True)
+            print(sign_msg, flush=True)
+            if capacity_msg:
+                print(capacity_msg, flush=True)
+            return {
+                "index": index,
+                "masked": masked,
+                "success": True,
+                "sign_msg": sign_msg,
+                "capacity_msg": capacity_msg,
+                "error": "",
+            }
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < MAX_NETWORK_RETRIES:
+                wait_sec = 3 * attempt
+                log_err(
+                    f"[重试] 账号{index}（{masked}）第 {attempt}/{MAX_NETWORK_RETRIES} 次请求遇到网络异常：{exc}，"
+                    f"{wait_sec} 秒后重建连接重试..."
+                )
+                time.sleep(wait_sec)
+            else:
+                log_err(f"[失败] 账号{index}（{masked}）已达最大网络重试次数（{MAX_NETWORK_RETRIES} 次）")
+        except Exception as exc:
+            # 业务类错误（如密码错误、风控拦截）不重复提交，以免触发锁号
+            last_exc = exc
+            break
 
-    session_key = login_by_password(session, username, password)
-    print("登录成功")
+    err_text = str(last_exc)
+    log_err(f"账号{index}（{masked}）执行失败：{err_text}")
+    return {
+        "index": index,
+        "masked": masked,
+        "success": False,
+        "sign_msg": "",
+        "capacity_msg": "",
+        "error": err_text,
+    }
 
-    before_cloud, before_family = _extract_totals(get_user_size_info(session, session_key))
 
-    sign_res = user_sign(session, session_key)
-    raw_is_sign = sign_res.get("isSign")
-    already_signed = raw_is_sign is True or str(raw_is_sign).lower() == "true"
-    bonus = sign_res.get("netdiskBonus", 0)
-    if already_signed:
-        print(f"今日已签到过了，今日奖励 {bonus}M 空间")
-    else:
-        print(f"签到成功，获得 {bonus}M 空间")
+def format_push_message(results: list[dict], now_str: str) -> str:
+    """按恩山签到同款风格构造 Telegram 汇总通知文本。"""
+    all_ok = bool(results) and all(item["success"] for item in results)
+    header = "✅ 天翼云盘签到成功" if all_ok else "❌ 天翼云盘签到失败"
 
-    after_cloud, after_family = _extract_totals(get_user_size_info(session, session_key))
-    cloud_diff_mb = (after_cloud - before_cloud) / 1024 / 1024
-    cloud_total_gb = after_cloud / 1024 / 1024 / 1024
-    family_diff_mb = (after_family - before_family) / 1024 / 1024
-    family_total_gb = after_family / 1024 / 1024 / 1024
-    print(
-        f"个人容量：+{cloud_diff_mb:.2f}M / 总计 {cloud_total_gb:.2f}G；"
-        f"家庭容量：+{family_diff_mb:.2f}M / 总计 {family_total_gb:.2f}G"
-    )
+    blocks = [header, f"签到时间: {now_str}"]
+    for item in results:
+        title = f"账号{item['index']} ({item['masked']})"
+        if item["success"]:
+            lines = [title, f"✅ {item['sign_msg']}"]
+            if item["capacity_msg"]:
+                lines.append(f"📊 {item['capacity_msg']}")
+        else:
+            lines = [title, f"❌ 原因: {item['error']}"]
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
 def main() -> None:
-    """读取环境变量中的账号密码并批量执行签到。"""
+    """读取环境变量中的账号密码，批量执行签到并推送通知。"""
+    cst = timezone(timedelta(hours=8))
+    now_str = datetime.now(cst).strftime("%Y-%m-%d %H:%M:%S")
+
     raw_users = os.getenv("TYYP_USERNAME", "")
     raw_passwords = os.getenv("TYYP_PSW", "")
 
@@ -245,25 +388,25 @@ def main() -> None:
     passwords = [p.strip() for p in raw_passwords.split("&") if p.strip()]
 
     if not usernames or not passwords:
-        print("错误：环境变量 TYYP_USERNAME 或 TYYP_PSW 未配置或为空", file=sys.stderr)
+        err = "环境变量 TYYP_USERNAME 或 TYYP_PSW 未配置或为空"
+        log_err(f"错误：{err}")
+        push_telegram(f"❌ 天翼云盘签到失败\n\n签到时间: {now_str}\n\n原因: {err}")
         sys.exit(1)
 
     if len(usernames) != len(passwords):
-        print(
-            f"错误：账号数量（{len(usernames)}）与密码数量（{len(passwords)}）不一致",
-            file=sys.stderr,
-        )
+        err = f"账号数量（{len(usernames)}）与密码数量（{len(passwords)}）不一致"
+        log_err(f"错误：{err}")
+        push_telegram(f"❌ 天翼云盘签到失败\n\n签到时间: {now_str}\n\n原因: {err}")
         sys.exit(1)
 
-    failed_count = 0
+    results: list[dict] = []
     for idx, (username, password) in enumerate(zip(usernames, passwords), start=1):
-        try:
-            run_account(idx, username, password)
-        except Exception as exc:
-            failed_count += 1
-            print(f"账号{idx}（{mask_account(username)}）执行失败：{exc}", file=sys.stderr)
+        results.append(run_account(idx, username, password))
 
-    if failed_count > 0:
+    summary_msg = format_push_message(results, now_str)
+    push_telegram(summary_msg)
+
+    if any(not item["success"] for item in results):
         sys.exit(1)
 
 
