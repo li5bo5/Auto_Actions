@@ -1,5 +1,5 @@
-- [![签到状态](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml/badge.svg?branch=main)](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml) <br> 签到时间：2026-11-26 14:34:21
+- [![签到状态](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml/badge.svg?branch=main)](https://github.com/li5bo5/Auto_Actions/actions/workflows/checkin.yml) <br> 签到时间：2026-11-26 14:49:47
 - 开始执行账号1（133****9518）
 - 登录成功
-- 签到成功，获得 51M 空间
-- 个人容量：+51.00M / 总计 4154.20G；家庭容量：+0.00M / 总计 2078.00G
+- 今日已签到过了，今日奖励 51M 空间
+- 个人容量：+0.00M / 总计 4154.20G；家庭容量：+0.00M / 总计 2078.00G
